@@ -1,0 +1,249 @@
+
+# =========================
+# 5) Whole-volume dataset (low-res) + fixed shape
+# =========================
+import torch.nn.functional as F
+
+DS_FACTOR = 1             # 2 → ~8× fewer voxels (good first try). Try 1 (no downsample) or 3 (very coarse).
+AUGMENT = True
+
+def round_up_to_multiple(x, m=16):
+    return int(math.ceil(x / m) * m)
+
+@torch.no_grad()
+def downsample_vol_and_mask(x_np, y_np, ds_factor=2):
+    """Downsample in voxel space by an integer factor.
+    - x: trilinear
+    - y: nearest
+    Returns float32 arrays."""
+    assert ds_factor >= 1 and int(ds_factor) == ds_factor
+    if ds_factor == 1:
+        return x_np.astype(np.float32), y_np.astype(np.float32)
+
+    x = torch.from_numpy(x_np[None,None].astype(np.float32))  # (1,1,D,H,W)
+    y = torch.from_numpy(y_np[None,None].astype(np.float32))
+
+    # target size
+    D,H,W = x.shape[-3:]
+    D2,H2,W2 = max(1, D//ds_factor), max(1, H//ds_factor), max(1, W//ds_factor)
+
+    x2 = F.interpolate(x, size=(D2,H2,W2), mode='trilinear', align_corners=False)
+    y2 = F.interpolate(y, size=(D2,H2,W2), mode='nearest')
+
+    return x2[0,0].cpu().numpy().astype(np.float32), y2[0,0].cpu().numpy().astype(np.float32)
+
+def center_pad_or_crop_3d(x_np, target_shape, pad_value=0.0):
+    """Center pad or center crop a 3D array to target_shape (D,H,W)."""
+    D,H,W = x_np.shape
+    TD,TH,TW = target_shape
+
+    # crop (center)
+    sd = max(0, (D - TD)//2)
+    sh = max(0, (H - TH)//2)
+    sw = max(0, (W - TW)//2)
+    x = x_np[sd:sd+min(D,TD), sh:sh+min(H,TH), sw:sw+min(W,TW)]
+
+    # pad (center)
+    D2,H2,W2 = x.shape
+    pd0 = max(0, (TD - D2)//2); pd1 = max(0, TD - D2 - pd0)
+    ph0 = max(0, (TH - H2)//2); ph1 = max(0, TH - H2 - ph0)
+    pw0 = max(0, (TW - W2)//2); pw1 = max(0, TW - W2 - pw0)
+
+    if pd0 or pd1 or ph0 or ph1 or pw0 or pw1:
+        x = np.pad(x, ((pd0,pd1),(ph0,ph1),(pw0,pw1)), mode='constant', constant_values=pad_value)
+    return x.astype(np.float32)
+
+def compute_target_shape(pairs, ds_factor=2, max_check=32):
+    """Compute a reasonable fixed TARGET_SHAPE by scanning up to max_check volumes.
+    We round up to a multiple of 16 (U-Net friendly)."""
+    scan = pairs[:max_check] if len(pairs) > max_check else pairs
+    maxD=maxH=maxW=0
+    for t1_path, m_path in scan:
+        x,_ = load_nii(t1_path)
+        y,_ = load_nii(m_path)
+        x2, y2 = downsample_vol_and_mask(x, (y>0.5).astype(np.float32), ds_factor=ds_factor)
+        D,H,W = x2.shape
+        maxD, maxH, maxW = max(maxD,D), max(maxH,H), max(maxW,W)
+
+    return (round_up_to_multiple(maxD,16), round_up_to_multiple(maxH,16), round_up_to_multiple(maxW,16))
+
+TARGET_SHAPE = compute_target_shape(train_pairs, ds_factor=DS_FACTOR, max_check=24)
+print("DS_FACTOR:", DS_FACTOR)
+print("TARGET_SHAPE:", TARGET_SHAPE)
+
+def zscore_robust(x, eps=1e-6, clip=5.0):
+    m = float(np.mean(x))
+    s = float(np.std(x)) + eps
+    z = (x - m) / s
+    if clip is not None:
+        z = np.clip(z, -clip, clip)
+    return z.astype(np.float32)
+
+class AtlasSegWholeVolDataset(Dataset):
+    def __init__(self, pairs, ds_factor=2, target_shape=(160,192,160), augment=True):
+        self.pairs = pairs
+        self.ds = ds_factor
+        self.target_shape = target_shape
+        self.augment = augment
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        t1_path, m_path = self.pairs[idx]
+        x_np,_ = load_nii(t1_path)
+        y_np,_ = load_nii(m_path)
+        y_np = (y_np > 0.5).astype(np.float32)
+
+        # downsample
+        x_np, y_np = downsample_vol_and_mask(x_np, y_np, ds_factor=self.ds)
+
+        # normalize (per-volume)
+        x_np = zscore_robust(x_np)
+
+        # fixed shape
+        x_np = center_pad_or_crop_3d(x_np, self.target_shape, pad_value=0.0)
+        y_np = center_pad_or_crop_3d(y_np, self.target_shape, pad_value=0.0)
+        y_np = (y_np > 0.5).astype(np.float32)
+
+        # simple aug: random flips (safe for segmentation)
+        if self.augment:
+            if random.random() < 0.5:
+                x_np = x_np[::-1,:,:].copy(); y_np = y_np[::-1,:,:].copy()
+            if random.random() < 0.5:
+                x_np = x_np[:,::-1,:].copy(); y_np = y_np[:,::-1,:].copy()
+            if random.random() < 0.5:
+                x_np = x_np[:,:,::-1].copy(); y_np = y_np[:,:,::-1].copy()
+
+        x_t = torch.from_numpy(x_np[None]).float()  # (1,D,H,W)
+        y_t = torch.from_numpy(y_np[None]).float()
+        return x_t, y_t
+
+train_ds = AtlasSegWholeVolDataset(train_pairs, ds_factor=DS_FACTOR, target_shape=TARGET_SHAPE, augment=AUGMENT)
+val_ds   = AtlasSegWholeVolDataset(val_pairs,   ds_factor=DS_FACTOR, target_shape=TARGET_SHAPE, augment=False)
+test_ds  = AtlasSegWholeVolDataset(test_pairs,  ds_factor=DS_FACTOR, target_shape=TARGET_SHAPE, augment=False)
+
+# Whole-volume → batch_size=1
+train_loader = DataLoader(train_ds, batch_size=1, shuffle=True, num_workers=0, pin_memory=(device.type=='cuda'))
+val_loader   = DataLoader(val_ds,   batch_size=1, shuffle=False, num_workers=0, pin_memory=(device.type=='cuda'))
+
+def dice_coeff_bin(pred_bin, gt_bin, eps=1e-6):
+    inter = (pred_bin * gt_bin).sum()
+    denom = pred_bin.sum() + gt_bin.sum()
+    return float((2*inter + eps) / (denom + eps))
+
+@torch.no_grad()
+def eval_val_wholevol(model, loader, thr=0.3, max_cases=None):
+    model.eval()
+    dices=[]
+    for i,(x_t,y_t) in enumerate(loader):
+        if max_cases is not None and i>=max_cases: break
+        x_t = x_t.to(device, non_blocking=True)
+        y_t = y_t.to(device, non_blocking=True)
+        logits = model(x_t)
+        probs = torch.sigmoid(logits)
+        pred = (probs >= thr).float()
+        d = dice_coeff_bin(pred, y_t)
+        dices.append(d)
+    return float(np.mean(dices)) if dices else 0.0
+
+def save_ckpt(path, model, opt, scaler, step):
+    torch.save({"model": model.state_dict(),
+                "opt": opt.state_dict(),
+                "scaler": scaler.state_dict(),
+                "step": int(step)}, path)
+
+
+
+# =========================
+# 6) 3D U-Net
+# =========================
+
+def center_crop_to(x, ref):
+    _, _, d, h, w = x.shape
+    _, _, rd, rh, rw = ref.shape
+    sd = (d - rd) // 2
+    sh = (h - rh) // 2
+    sw = (w - rw) // 2
+    return x[:, :, sd:sd+rd, sh:sh+rh, sw:sw+rw]
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_ch, out_ch, p_drop=0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv3d(in_ch, out_ch, 3, padding=1),
+            nn.InstanceNorm3d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Dropout3d(p_drop) if p_drop>0 else nn.Identity(),
+            nn.Conv3d(out_ch, out_ch, 3, padding=1),
+            nn.InstanceNorm3d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class UNet3D(nn.Module):
+    def __init__(self, in_ch=1, base=16, p_drop=0.1):
+        super().__init__()
+        self.enc1 = DoubleConv(in_ch, base, p_drop)
+        self.pool1 = nn.MaxPool3d(2)
+        self.enc2 = DoubleConv(base, base*2, p_drop)
+        self.pool2 = nn.MaxPool3d(2)
+        self.enc3 = DoubleConv(base*2, base*4, p_drop)
+        self.pool3 = nn.MaxPool3d(2)
+
+        self.bott = DoubleConv(base*4, base*8, p_drop)
+
+        self.up3 = nn.ConvTranspose3d(base*8, base*4, 2, stride=2)
+        self.dec3 = DoubleConv(base*8, base*4, p_drop)
+        self.up2 = nn.ConvTranspose3d(base*4, base*2, 2, stride=2)
+        self.dec2 = DoubleConv(base*4, base*2, p_drop)
+        self.up1 = nn.ConvTranspose3d(base*2, base, 2, stride=2)
+        self.dec1 = DoubleConv(base*2, base, p_drop)
+
+        self.out = nn.Conv3d(base, 1, 1)  # logits
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool1(e1))
+        e3 = self.enc3(self.pool2(e2))
+        b  = self.bott(self.pool3(e3))
+
+        d3 = self.up3(b)
+        if e3.shape[2:] != d3.shape[2:]:
+            e3 = center_crop_to(e3, d3)
+        d3 = self.dec3(torch.cat([d3, e3], dim=1))
+
+        d2 = self.up2(d3)
+        if e2.shape[2:] != d2.shape[2:]:
+            e2 = center_crop_to(e2, d2)
+        d2 = self.dec2(torch.cat([d2, e2], dim=1))
+
+        d1 = self.up1(d2)
+        if e1.shape[2:] != d1.shape[2:]:
+            e1 = center_crop_to(e1, d1)
+        d1 = self.dec1(torch.cat([d1, e1], dim=1))
+
+        return self.out(d1)
+
+model = UNet3D(in_ch=1, base=16, p_drop=0.1).to(device)
+print(model.__class__.__name__)
+
+# =========================
+# 7) Losses: Dice + BCE (logits)
+# =========================
+pos_w = torch.tensor([2], device=device)   # try 10, 20, 50
+bce = nn.BCEWithLogitsLoss(pos_weight=pos_w)
+
+def soft_dice_loss_from_logits(logits, targets, eps=1e-6):
+    probs = torch.sigmoid(logits)
+    # flatten per batch
+    probs = probs.reshape(probs.shape[0], -1)
+    targets = targets.reshape(targets.shape[0], -1)
+    inter = (probs * targets).sum(dim=1)
+    denom = probs.sum(dim=1) + targets.sum(dim=1)
+    dice = (2*inter + eps) / (denom + eps)
+    return 1.0 - dice.mean()
+
+def combo_loss(logits, targets, w_dice=0.8, w_bce=0.2):
+    return w_dice * soft_dice_loss_from_logits(logits, targets) + w_bce * bce(logits, targets)
