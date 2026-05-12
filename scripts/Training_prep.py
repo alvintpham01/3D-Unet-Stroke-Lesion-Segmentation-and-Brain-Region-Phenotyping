@@ -232,7 +232,7 @@ print(model.__class__.__name__)
 # =========================
 # 7) Losses: Dice + BCE (logits)
 # =========================
-pos_w = torch.tensor([2], device=device)   # try 10, 20, 50
+pos_w = torch.tensor([20], device=device)   # try 10, 20, 50
 bce = nn.BCEWithLogitsLoss(pos_weight=pos_w)
 
 def soft_dice_loss_from_logits(logits, targets, eps=1e-6):
