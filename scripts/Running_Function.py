@@ -91,3 +91,8 @@ def run_real_case_wholebrain(t1_path, real_mask_path, title="", show_thr=0.8, sh
     plt.axis("off")
     plt.tight_layout()
     plt.show()
+
+#CALLING
+for i in range(1):
+    t1_path, mask_path = test_pairs[i]
+    run_real_case_wholebrain(t1_path, mask_path, title=f"Real case {i}", show_thr=0.3, show_overlay=True)
